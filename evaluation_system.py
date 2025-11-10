@@ -8,6 +8,7 @@ from enum import Enum
 import json
 from datetime import datetime
 import logging
+import os
 
 from abc import ABC, abstractmethod
 
@@ -29,7 +30,9 @@ import pandas as pd
 from sklearn.metrics import cohen_kappa_score, accuracy_score, f1_score, classification_report
 from scipy.stats import pearsonr, spearmanr
 import numpy as np
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -1462,3 +1465,145 @@ class ProductionMonitor:
             'samples': len(recent),
             'recommendation': 'Re-validate evaluator' if drift_detected else 'Continue monitoring'
         }
+
+def main():
+    """Complete example of the evaluation system"""
+    
+    # Configuration
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    
+    # Initialize evaluators
+    evaluators = [
+        # Tier 1: Fast checks
+        LengthValidator(min_length=20, max_length=2000),
+        EntityHallucinationDetector(),
+        SemanticConsistencyChecker(),
+        
+        # Tier 2: NLP models
+        NLIConsistencyChecker(),
+        
+        # Tier 3: LLM-as-Judge
+        LLMAsJudgeEvaluator(ANTHROPIC_API_KEY, provider="anthropic"),
+        ClaimVerificationEvaluator(ANTHROPIC_API_KEY, provider="anthropic")
+    ]
+    
+    # Create pipeline
+    pipeline = EvaluationPipeline(
+        evaluators=evaluators,
+        early_stopping=True,
+        cost_threshold=0.05
+    )
+    
+    print("="*80)
+    print("LLM RESPONSE EVALUATION SYSTEM")
+    print("="*80)
+    
+    # Example 1: Single evaluation
+    print("\n" + "="*80)
+    print("EXAMPLE 1: Single Response Evaluation")
+    print("="*80)
+    
+    context1 = EvaluationContext(
+        query="What is the capital of France?",
+        response="The capital of France is Paris, which is located in the northern part of the country. Paris is known for its iconic Eiffel Tower and is one of the most visited cities in the world.",
+        reference_docs="Paris is the capital and most populous city of France. The city is located in the north-central part of the country."
+    )
+    
+    result1 = pipeline.evaluate(context1)
+    print(f"\nResult: {result1.summary}")
+    print(f"Score: {result1.overall_score:.2f}")
+    print(f"Status: {result1.overall_status.value}")
+    print(f"Confidence: {result1.confidence:.2f}")
+    print(f"Flagged for review: {result1.flagged_for_review}")
+    
+    print("\nDetailed Breakdown:")
+    for metric_name, metric_result in result1.individual_results.items():
+        print(f"  {metric_name}:")
+        print(f"    Score: {metric_result.score:.2f}")
+        print(f"    Status: {metric_result.status.value}")
+        print(f"    Reasoning: {metric_result.reasoning}")
+    
+    # Example 2: Hallucination detection
+    print("\n" + "="*80)
+    print("EXAMPLE 2: Hallucination Detection")
+    print("="*80)
+    
+    context2 = EvaluationContext(
+        query="Who invented the telephone?",
+        response="Alexander Graham Bell invented the telephone in 1876. He was born in Scotland and later moved to Canada, where he conducted most of his experiments. Bell also invented the airplane and the first computer.",
+        reference_docs="Alexander Graham Bell was a Scottish-born inventor who is credited with inventing and patenting the first practical telephone in 1876. Bell was born in Edinburgh, Scotland, and later emigrated to Canada."
+    )
+    
+    result2 = pipeline.evaluate(context2)
+    print(f"\nResult: {result2.summary}")
+    print(f"Score: {result2.overall_score:.2f}")
+    print(f"Status: {result2.overall_status.value}")
+    
+    # Example 3: Batch evaluation
+    print("\n" + "="*80)
+    print("EXAMPLE 3: Batch Evaluation")
+    print("="*80)
+    
+    test_contexts = [
+        EvaluationContext(
+            query=f"What is {2+i} + {3+i}?",
+            response=f"The answer is {2+i+3+i}.",
+            reference_docs=f"{2+i} plus {3+i} equals {5+2*i}."
+        )
+        for i in range(5)
+    ]
+    
+    batch_evaluator = BatchEvaluator(pipeline, max_workers=3)
+    
+    print("Evaluating batch...")
+    batch_results = batch_evaluator.evaluate_batch(
+        test_contexts,
+        parallel=True,
+        progress_callback=lambda done, total: print(f"  Progress: {done}/{total}")
+    )
+    
+    # Generate report
+    report = batch_evaluator.generate_report(test_contexts, batch_results)
+    
+    print(f"\nBatch Evaluation Report:")
+    print(f"  Total evaluated: {report['summary']['total_evaluated']}")
+    print(f"  Passed: {report['summary']['passed']}")
+    print(f"  Failed: {report['summary']['failed']}")
+    print(f"  Flagged: {report['summary']['flagged']}")
+    print(f"  Pass rate: {report['pass_rate']:.1%}")
+    print(f"  Average score: {report['summary']['avg_score']:.2f}")
+    
+    # Example 4: Validation
+    print("\n" + "="*80)
+    print("EXAMPLE 4: Evaluator Validation")
+    print("="*80)
+    
+    # Simulate human labels
+    validation_contexts = test_contexts
+    human_scores = [0.9, 0.85, 0.95, 0.8, 0.9]
+    human_labels = [True, True, True, True, True]
+    
+    validator = EvaluatorValidator(pipeline)
+    validation_results = validator.validate_against_human_labels(
+        validation_contexts,
+        human_scores,
+        human_labels
+    )
+    
+    # Export to CSV
+    print("\n" + "="*80)
+    print("EXPORTING RESULTS")
+    print("="*80)
+    
+    df = batch_evaluator.export_to_dataframe(test_contexts, batch_results)
+    df.to_csv('evaluation_results.csv', index=False)
+    print("Results exported to: evaluation_results.csv")
+    
+    # Save report as JSON
+    with open('evaluation_report.json', 'w') as f:
+        json.dump(report, f, indent=2, default=str)
+    print("Report saved to: evaluation_report.json")
+
+
+if __name__ == "__main__":
+    main()
