@@ -17,6 +17,10 @@ from collections import Counter
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
+    
+from pydantic import BaseModel, Field
+
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -471,5 +475,395 @@ class NLIConsistencyChecker(BaseEvaluator):
             passed=True,
             confidence=0.0,
             reasoning="Evaluator skipped",
+            status=EvaluationStatus.PASSED
+        )
+
+
+
+class FactualityAssessment(BaseModel):
+    """Structured output for factuality evaluation"""
+    overall_score: int = Field(ge=1, le=5, description="Overall factuality score 1-5")
+    has_hallucination: bool = Field(description="Whether response contains hallucinations")
+    accuracy: int = Field(ge=1, le=5, description="Factual accuracy score")
+    relevance: int = Field(ge=1, le=5, description="Relevance to query")
+    completeness: int = Field(ge=1, le=5, description="Completeness of answer")
+    reasoning: str = Field(description="Detailed reasoning for scores")
+    problematic_claims: List[str] = Field(default_factory=list, description="Specific problematic claims")
+    confidence: str = Field(description="Confidence level: high, medium, or low")
+
+
+class LLMAsJudgeEvaluator(BaseEvaluator):
+    """Comprehensive evaluation using Claude/GPT-4 as judge"""
+    
+    def __init__(self, api_key: str, provider: str = "anthropic", model: str = None):
+        super().__init__(name="llm_judge_factuality", weight=3.0, critical=True)
+        
+        self.provider = provider
+        
+        if provider == "anthropic":
+            import anthropic
+            self.client = anthropic.Anthropic(api_key=api_key)
+            self.model = model or "claude-sonnet-4-20250514"
+        elif provider == "openai":
+            import openai
+            self.client = openai.OpenAI(api_key=api_key)
+            self.model = model or "gpt-4o"
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
+    
+    def evaluate(self, context: EvaluationContext) -> EvaluationResult:
+        """Comprehensive factuality evaluation"""
+        
+        prompt = self._build_prompt(context)
+        
+        try:
+            if self.provider == "anthropic":
+                response = self._call_anthropic(prompt)
+            else:
+                response = self._call_openai(prompt)
+            
+            # Parse structured output
+            assessment = self._parse_response(response)
+            
+            # Normalize score to 0-1
+            normalized_score = assessment.overall_score / 5.0
+            
+            # Determine confidence
+            confidence_map = {"high": 0.95, "medium": 0.75, "low": 0.5}
+            confidence = confidence_map.get(assessment.confidence.lower(), 0.7)
+            
+            # Determine pass/fail
+            passed = (
+                assessment.overall_score >= 4 and
+                not assessment.has_hallucination and
+                assessment.accuracy >= 4
+            )
+            
+            if assessment.has_hallucination:
+                status = EvaluationStatus.FAILED
+            elif assessment.overall_score < 3:
+                status = EvaluationStatus.FAILED
+            elif assessment.overall_score == 3:
+                status = EvaluationStatus.FLAGGED
+            else:
+                status = EvaluationStatus.PASSED
+            
+            return EvaluationResult(
+                metric_name=self.name,
+                score=normalized_score,
+                passed=passed,
+                confidence=confidence,
+                reasoning=assessment.reasoning,
+                status=status,
+                metadata={
+                    'accuracy': assessment.accuracy,
+                    'relevance': assessment.relevance,
+                    'completeness': assessment.completeness,
+                    'problematic_claims': assessment.problematic_claims,
+                    'has_hallucination': assessment.has_hallucination
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"LLM evaluation failed: {e}")
+            return EvaluationResult(
+                metric_name=self.name,
+                score=0.0,
+                passed=False,
+                confidence=0.0,
+                reasoning=f"Evaluation error: {str(e)}",
+                status=EvaluationStatus.ERROR,
+                metadata={'error': str(e)}
+            )
+    
+    def _build_prompt(self, context: EvaluationContext) -> str:
+        """Build comprehensive evaluation prompt"""
+        
+        prompt = f"""You are an expert evaluator assessing AI-generated responses for factuality, accuracy, and hallucinations.
+
+QUERY: {context.query}
+
+AI RESPONSE TO EVALUATE:
+{context.response}
+"""
+        
+        if context.reference_docs:
+            prompt += f"""
+REFERENCE DOCUMENTS (Ground Truth):
+{context.reference_docs[:2000]}  
+"""
+        
+        if context.ground_truth:
+            prompt += f"""
+EXPECTED ANSWER:
+{context.ground_truth}
+"""
+        
+        prompt += """
+
+EVALUATION CRITERIA:
+
+1. FACTUAL ACCURACY (1-5):
+   - Are all factual claims correct and verifiable?
+   - Are there any fabricated facts, statistics, or quotes?
+   
+2. HALLUCINATION CHECK:
+   - Does the response contain information NOT supported by the reference documents?
+   - Are there invented details, names, or events?
+   
+3. RELEVANCE (1-5):
+   - Does the response directly answer the query?
+   - Is all information provided relevant?
+   
+4. COMPLETENESS (1-5):
+   - Does it address all aspects of the query?
+   - Is any critical information missing?
+
+SCORING RUBRIC:
+5 - Excellent: Completely accurate, no hallucinations, comprehensive
+4 - Good: Accurate with minor omissions, no significant hallucinations
+3 - Acceptable: Mostly accurate but has issues or gaps
+2 - Poor: Significant inaccuracies or unsupported claims
+1 - Unacceptable: Mostly inaccurate or heavily hallucinated
+
+CONFIDENCE LEVELS:
+- "high": Very confident in evaluation (clear-cut case)
+- "medium": Moderately confident (some ambiguity)
+- "low": Low confidence (needs human review)
+
+Respond ONLY with valid JSON (no markdown formatting, no code blocks):
+{
+    "overall_score": <1-5>,
+    "has_hallucination": <true/false>,
+    "accuracy": <1-5>,
+    "relevance": <1-5>,
+    "completeness": <1-5>,
+    "reasoning": "<detailed explanation of scores, specific examples of issues>",
+    "problematic_claims": ["<claim 1>", "<claim 2>"],
+    "confidence": "<high/medium/low>"
+}"""
+        
+        return prompt
+    
+    def _call_anthropic(self, prompt: str) -> str:
+        """Call Claude API"""
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=2000,
+            temperature=0,  # Deterministic for evaluation
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    
+    def _call_openai(self, prompt: str) -> str:
+        """Call OpenAI API"""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"}
+        )
+        return response.choices[0].message.content
+    
+    def _parse_response(self, response: str) -> FactualityAssessment:
+        """Parse JSON response into structured format"""
+        # Clean response (remove markdown if present)
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'```json\s*|\s*```', '', cleaned)
+        
+        data = json.loads(cleaned)
+        return FactualityAssessment(**data)
+
+
+class ClaimVerificationEvaluator(BaseEvaluator):
+    """Extracts and verifies individual claims"""
+    
+    def __init__(self, api_key: str, provider: str = "anthropic"):
+        super().__init__(name="claim_verification", weight=2.5, critical=True)
+        
+        if provider == "anthropic":
+            import anthropic
+            self.client = anthropic.Anthropic(api_key=api_key)
+            self.model = "claude-sonnet-4-20250514"
+        else:
+            import openai
+            self.client = openai.OpenAI(api_key=api_key)
+            self.model = "gpt-4o"
+        
+        self.provider = provider
+    
+    def should_run(self, context: EvaluationContext) -> bool:
+        """Only run for responses with reference docs"""
+        return context.reference_docs is not None and len(context.response) > 50
+    
+    def evaluate(self, context: EvaluationContext) -> EvaluationResult:
+        """Extract and verify claims"""
+        
+        if not self.should_run(context):
+            return self._skip_result()
+        
+        try:
+            # Step 1: Extract claims
+            claims = self._extract_claims(context.response)
+            
+            if not claims or len(claims) == 0:
+                return EvaluationResult(
+                    metric_name=self.name,
+                    score=1.0,
+                    passed=True,
+                    confidence=0.6,
+                    reasoning="No verifiable factual claims found",
+                    status=EvaluationStatus.PASSED
+                )
+            
+            # Step 2: Verify each claim
+            verified = []
+            unverified = []
+            
+            for claim in claims[:10]:  # Limit to 10 claims for cost
+                is_supported = self._verify_claim(claim, context.reference_docs)
+                if is_supported:
+                    verified.append(claim)
+                else:
+                    unverified.append(claim)
+            
+            # Calculate score
+            total = len(verified) + len(unverified)
+            score = len(verified) / total if total > 0 else 1.0
+            
+            # Determine status
+            if score >= 0.9:
+                passed = True
+                status = EvaluationStatus.PASSED
+                reasoning = f"All claims verified ({len(verified)}/{total})"
+            elif score >= 0.7:
+                passed = True
+                status = EvaluationStatus.PASSED
+                reasoning = f"Most claims verified ({len(verified)}/{total})"
+            elif score >= 0.5:
+                passed = False
+                status = EvaluationStatus.FLAGGED
+                reasoning = f"Some unverified claims ({len(unverified)}/{total})"
+            else:
+                passed = False
+                status = EvaluationStatus.FAILED
+                reasoning = f"Many unverified claims ({len(unverified)}/{total})"
+            
+            return EvaluationResult(
+                metric_name=self.name,
+                score=score,
+                passed=passed,
+                confidence=0.85,
+                reasoning=reasoning,
+                status=status,
+                metadata={
+                    'total_claims': total,
+                    'verified_claims': len(verified),
+                    'unverified_claims': unverified[:3],
+                    'verification_rate': score
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Claim verification failed: {e}")
+            return EvaluationResult(
+                metric_name=self.name,
+                score=0.5,
+                passed=True,
+                confidence=0.0,
+                reasoning=f"Verification error: {str(e)}",
+                status=EvaluationStatus.ERROR
+            )
+    
+    def _extract_claims(self, response: str) -> List[str]:
+        """Extract atomic claims from response"""
+        
+        prompt = f"""Extract all factual claims from this text as a JSON list. 
+
+Requirements for each claim:
+- Atomic (one fact per claim)
+- Self-contained (understandable without context)
+- Verifiable (can be checked against source)
+- Exclude opinions and subjective statements
+
+Text: {response}
+
+Respond with JSON only (no markdown):
+{{"claims": ["claim 1", "claim 2", ...]}}"""
+        
+        if self.provider == "anthropic":
+            result = self.client.messages.create(
+                model=self.model,
+                max_tokens=1500,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = result.content[0].text
+        else:
+            result = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                response_format={"type": "json_object"}
+            )
+            text = result.choices[0].message.content
+        
+        # Parse response
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'```json\s*|\s*```', '', cleaned)
+        
+        data = json.loads(cleaned)
+        return data.get("claims", [])
+    
+    def _verify_claim(self, claim: str, reference: str) -> bool:
+        """Verify if claim is supported"""
+        
+        prompt = f"""Is this claim fully supported by the reference text?
+
+Claim: {claim}
+
+Reference: {reference[:1500]}
+
+Rules:
+- Return true ONLY if the claim is explicitly or clearly implied by the reference
+- Return false if the claim adds information not in the reference
+- Return false if uncertain
+
+Respond with JSON only (no markdown):
+{{"supported": true/false, "reasoning": "brief explanation"}}"""
+        
+        if self.provider == "anthropic":
+            result = self.client.messages.create(
+                model=self.model,
+                max_tokens=200,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = result.content[0].text
+        else:
+            result = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                response_format={"type": "json_object"}
+            )
+            text = result.choices[0].message.content
+        
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'```json\s*|\s*```', '', cleaned)
+        
+        data = json.loads(cleaned)
+        return data.get("supported", False)
+    
+    def _skip_result(self) -> EvaluationResult:
+        return EvaluationResult(
+            metric_name=self.name,
+            score=0.5,
+            passed=True,
+            confidence=0.0,
+            reasoning="Evaluator skipped (no reference docs)",
             status=EvaluationStatus.PASSED
         )
