@@ -23,6 +23,11 @@ from pydantic import BaseModel, Field
 from typing import Optional
 import time
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+import pandas as pd
+
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -1075,3 +1080,164 @@ class EvaluationPipeline:
             summary = f"⚠ Response flagged: {'; '.join(flags)}"
         
         return summary
+    
+
+class BatchEvaluator:
+    """Batch evaluation with progress tracking"""
+    
+    def __init__(self, pipeline: EvaluationPipeline, max_workers: int = 5):
+        self.pipeline = pipeline
+        self.max_workers = max_workers
+    
+    def evaluate_batch(
+        self,
+        contexts: List[EvaluationContext],
+        parallel: bool = True,
+        progress_callback: Optional[callable] = None
+    ) -> List[AggregatedResult]:
+        """Evaluate multiple contexts"""
+        
+        results = []
+        total = len(contexts)
+        
+        if parallel and total > 1:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(self.pipeline.evaluate, ctx): idx
+                    for idx, ctx in enumerate(contexts)
+                }
+                
+                for idx, future in enumerate(as_completed(future_to_idx)):
+                    result = future.result()
+                    results.append((future_to_idx[future], result))
+                    
+                    if progress_callback:
+                        progress_callback(idx + 1, total)
+            
+            # Sort by original order
+            results.sort(key=lambda x: x[0])
+            results = [r[1] for r in results]
+        else:
+            for idx, ctx in enumerate(contexts):
+                result = self.pipeline.evaluate(ctx)
+                results.append(result)
+                
+                if progress_callback:
+                    progress_callback(idx + 1, total)
+        
+        return results
+    
+    def generate_report(
+        self,
+        contexts: List[EvaluationContext],
+        results: List[AggregatedResult]
+    ) -> Dict:
+        """Generate comprehensive evaluation report"""
+        
+        report = {
+            'summary': {
+                'total_evaluated': len(results),
+                'passed': sum(1 for r in results if r.overall_status == EvaluationStatus.PASSED),
+                'failed': sum(1 for r in results if r.overall_status == EvaluationStatus.FAILED),
+                'flagged': sum(1 for r in results if r.overall_status == EvaluationStatus.FLAGGED),
+                'avg_score': sum(r.overall_score for r in results) / len(results),
+                'avg_confidence': sum(r.confidence for r in results) / len(results)
+            },
+            'pass_rate': sum(1 for r in results if r.overall_status == EvaluationStatus.PASSED) / len(results),
+            'metric_breakdown': {},
+            'failure_analysis': defaultdict(int),
+            'samples': {
+                'best': [],
+                'worst': [],
+                'flagged': []
+            }
+        }
+        
+        # Per-metric statistics
+        metric_scores = defaultdict(list)
+        for result in results:
+            for metric_name, metric_result in result.individual_results.items():
+                metric_scores[metric_name].append(metric_result.score)
+                
+                if metric_result.status == EvaluationStatus.FAILED:
+                    report['failure_analysis'][metric_name] += 1
+        
+        report['metric_breakdown'] = {
+            metric: {
+                'avg_score': sum(scores) / len(scores),
+                'min_score': min(scores),
+                'max_score': max(scores),
+                'failure_count': report['failure_analysis'].get(metric, 0)
+            }
+            for metric, scores in metric_scores.items()
+        }
+        
+        # Sample examples
+        sorted_results = sorted(
+            zip(contexts, results),
+            key=lambda x: x[1].overall_score,
+            reverse=True
+        )
+        
+        # Best examples
+        for ctx, res in sorted_results[:3]:
+            if res.overall_status == EvaluationStatus.PASSED:
+                report['samples']['best'].append({
+                    'query': ctx.query[:100],
+                    'response': ctx.response[:200],
+                    'score': res.overall_score,
+                    'summary': res.summary
+                })
+        
+        # Worst examples
+        for ctx, res in sorted_results[-3:]:
+            if res.overall_status == EvaluationStatus.FAILED:
+                report['samples']['worst'].append({
+                    'query': ctx.query[:100],
+                    'response': ctx.response[:200],
+                    'score': res.overall_score,
+                    'summary': res.summary
+                })
+        
+        # Flagged examples
+        for ctx, res in zip(contexts, results):
+            if res.flagged_for_review:
+                report['samples']['flagged'].append({
+                    'query': ctx.query[:100],
+                    'response': ctx.response[:200],
+                    'score': res.overall_score,
+                    'summary': res.summary
+                })
+                
+                if len(report['samples']['flagged']) >= 5:
+                    break
+        
+        return report
+    
+    def export_to_dataframe(
+        self,
+        contexts: List[EvaluationContext],
+        results: List[AggregatedResult]
+    ) -> pd.DataFrame:
+        """Export results to pandas DataFrame"""
+        
+        rows = []
+        for ctx, res in zip(contexts, results):
+            row = {
+                'query': ctx.query,
+                'response': ctx.response,
+                'overall_score': res.overall_score,
+                'overall_status': res.overall_status.value,
+                'confidence': res.confidence,
+                'flagged': res.flagged_for_review,
+                'summary': res.summary
+            }
+            
+            # Add individual metric scores
+            for metric_name, metric_result in res.individual_results.items():
+                row[f'{metric_name}_score'] = metric_result.score
+                row[f'{metric_name}_passed'] = metric_result.passed
+            
+            rows.append(row)
+        
+        return pd.DataFrame(rows)
