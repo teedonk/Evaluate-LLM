@@ -20,13 +20,15 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
     
 from pydantic import BaseModel, Field
 
-from typing import Optional
 import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 import pandas as pd
 
+from sklearn.metrics import cohen_kappa_score, accuracy_score, f1_score, classification_report
+from scipy.stats import pearsonr, spearmanr
+import numpy as np
 
 
 # Setup logging
@@ -1241,3 +1243,222 @@ class BatchEvaluator:
             rows.append(row)
         
         return pd.DataFrame(rows)
+    
+
+
+class EvaluatorValidator:
+    """Validate evaluator reliability against human judgments"""
+    
+    def __init__(self, pipeline: EvaluationPipeline):
+        self.pipeline = pipeline
+    
+    def validate_against_human_labels(
+        self,
+        contexts: List[EvaluationContext],
+        human_scores: List[float],  # 0.0 to 1.0
+        human_labels: List[bool]  # Pass/Fail
+    ) -> Dict:
+        """Compare evaluator against human judgments"""
+        
+        logger.info("Validating evaluator against human labels...")
+        
+        # Run evaluator
+        llm_results = []
+        for ctx in contexts:
+            result = self.pipeline.evaluate(ctx)
+            llm_results.append(result)
+        
+        llm_scores = [r.overall_score for r in llm_results]
+        llm_labels = [r.overall_status == EvaluationStatus.PASSED for r in llm_results]
+        
+        # Calculate correlation (scores)
+        pearson_corr, pearson_p = pearsonr(human_scores, llm_scores)
+        spearman_corr, spearman_p = spearmanr(human_scores, llm_scores)
+        
+        # Calculate agreement (binary labels)
+        accuracy = accuracy_score(human_labels, llm_labels)
+        kappa = cohen_kappa_score(human_labels, llm_labels)
+        f1 = f1_score(human_labels, llm_labels)
+        
+        # Classification report
+        report = classification_report(
+            human_labels,
+            llm_labels,
+            target_names=['Fail', 'Pass'],
+            output_dict=True
+        )
+        
+        validation_results = {
+            'correlation': {
+                'pearson': pearson_corr,
+                'pearson_p_value': pearson_p,
+                'spearman': spearman_corr,
+                'spearman_p_value': spearman_p
+            },
+            'agreement': {
+                'accuracy': accuracy,
+                'cohens_kappa': kappa,
+                'f1_score': f1,
+                'precision': report['Pass']['precision'],
+                'recall': report['Pass']['recall']
+            },
+            'interpretation': self._interpret_results(pearson_corr, kappa, accuracy)
+        }
+        
+        # Print report
+        print("\n" + "="*60)
+        print("EVALUATOR VALIDATION REPORT")
+        print("="*60)
+        print(f"\nCorrelation Analysis:")
+        print(f"  Pearson correlation:  {pearson_corr:.3f} (p={pearson_p:.4f})")
+        print(f"  Spearman correlation: {spearman_corr:.3f} (p={spearman_p:.4f})")
+        
+        print(f"\nAgreement Analysis:")
+        print(f"  Accuracy:      {accuracy:.1%}")
+        print(f"  Cohen's Kappa: {kappa:.3f}")
+        print(f"  F1 Score:      {f1:.3f}")
+        print(f"  Precision:     {report['Pass']['precision']:.1%}")
+        print(f"  Recall:        {report['Pass']['recall']:.1%}")
+        
+        print(f"\nInterpretation:")
+        print(f"  {validation_results['interpretation']}")
+        print("="*60 + "\n")
+        
+        return validation_results
+    
+    def _interpret_results(self, correlation: float, kappa: float, accuracy: float) -> str:
+        """Interpret validation metrics"""
+        
+        if kappa >= 0.8 and correlation >= 0.75:
+            return "✓ EXCELLENT: Evaluator highly reliable, safe for production use"
+        elif kappa >= 0.6 and correlation >= 0.6:
+            return "⚠ MODERATE: Evaluator acceptable, recommend human sampling (10-20%)"
+        elif kappa >= 0.4:
+            return "⚠ FAIR: Evaluator needs improvement, use with caution (30%+ sampling)"
+        else:
+            return "✗ POOR: Evaluator unreliable, requires major refinement"
+    
+    def cross_validate_evaluators(
+        self,
+        contexts: List[EvaluationContext],
+        evaluator_configs: List[Dict]
+    ) -> Dict:
+        """Compare multiple evaluator configurations"""
+        
+        logger.info("Cross-validating multiple evaluator configurations...")
+        
+        results_matrix = []
+        
+        for config in evaluator_configs:
+            # Create pipeline with this config
+            pipeline = self._create_pipeline_from_config(config)
+            
+            # Evaluate all contexts
+            scores = []
+            for ctx in contexts:
+                result = pipeline.evaluate(ctx)
+                scores.append(result.overall_score)
+            
+            results_matrix.append(scores)
+        
+        # Calculate inter-evaluator agreement
+        correlations = []
+        for i in range(len(results_matrix)):
+            for j in range(i + 1, len(results_matrix)):
+                corr, _ = pearsonr(results_matrix[i], results_matrix[j])
+                correlations.append(corr)
+        
+        avg_correlation = np.mean(correlations)
+        
+        print(f"\nCross-Validation Results:")
+        print(f"  Average inter-evaluator correlation: {avg_correlation:.3f}")
+        
+        if avg_correlation >= 0.8:
+            print("  ✓ High agreement between evaluators")
+        elif avg_correlation >= 0.6:
+            print("  ⚠ Moderate agreement - some inconsistency")
+        else:
+            print("  ✗ Low agreement - evaluators disagree significantly")
+        
+        return {
+            'avg_correlation': avg_correlation,
+            'all_correlations': correlations,
+            'results_matrix': results_matrix
+        }
+    
+    def _create_pipeline_from_config(self, config: Dict) -> EvaluationPipeline:
+        """Helper to create pipeline from config"""
+        # Implementation depends on your config structure
+        pass
+
+
+class ProductionMonitor:
+    """Monitor evaluator performance in production"""
+    
+    def __init__(self, pipeline: EvaluationPipeline, sampling_rate: float = 0.05):
+        self.pipeline = pipeline
+        self.sampling_rate = sampling_rate
+        self.human_feedback = []
+    
+    def evaluate_with_sampling(
+        self,
+        context: EvaluationContext
+    ) -> Tuple[AggregatedResult, bool]:
+        """Evaluate and randomly flag for human review"""
+        
+        result = self.pipeline.evaluate(context)
+        
+        # Random sampling for validation
+        import random
+        needs_human_review = (
+            result.flagged_for_review or
+            random.random() < self.sampling_rate
+        )
+        
+        return result, needs_human_review
+    
+    def record_human_feedback(
+        self,
+        context: EvaluationContext,
+        llm_result: AggregatedResult,
+        human_score: float,
+        human_passed: bool
+    ):
+        """Record human judgment for monitoring"""
+        
+        self.human_feedback.append({
+            'llm_score': llm_result.overall_score,
+            'llm_passed': llm_result.overall_status == EvaluationStatus.PASSED,
+            'human_score': human_score,
+            'human_passed': human_passed,
+            'timestamp': datetime.now()
+        })
+    
+    def calculate_drift(self, window_size: int = 100) -> Dict:
+        """Detect if evaluator is drifting from human judgment"""
+        
+        if len(self.human_feedback) < window_size:
+            return {'status': 'insufficient_data', 'samples': len(self.human_feedback)}
+        
+        recent = self.human_feedback[-window_size:]
+        
+        llm_scores = [f['llm_score'] for f in recent]
+        human_scores = [f['human_score'] for f in recent]
+        
+        correlation, _ = pearsonr(llm_scores, human_scores)
+        
+        llm_labels = [f['llm_passed'] for f in recent]
+        human_labels = [f['human_passed'] for f in recent]
+        
+        agreement = sum(1 for l, h in zip(llm_labels, human_labels) if l == h) / len(recent)
+        
+        # Check for drift
+        drift_detected = correlation < 0.6 or agreement < 0.7
+        
+        return {
+            'status': 'drift_detected' if drift_detected else 'healthy',
+            'correlation': correlation,
+            'agreement': agreement,
+            'samples': len(recent),
+            'recommendation': 'Re-validate evaluator' if drift_detected else 'Continue monitoring'
+        }
