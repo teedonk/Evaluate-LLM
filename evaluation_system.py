@@ -20,6 +20,9 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
     
 from pydantic import BaseModel, Field
 
+from typing import Optional
+import time
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -867,3 +870,208 @@ Respond with JSON only (no markdown):
             reasoning="Evaluator skipped (no reference docs)",
             status=EvaluationStatus.PASSED
         )
+    
+
+class EvaluationPipeline:
+    """Orchestrates multi-tier evaluation"""
+    
+    def __init__(
+        self,
+        evaluators: List[BaseEvaluator],
+        early_stopping: bool = True,
+        cost_threshold: float = 0.05  # Max $ per evaluation
+    ):
+        self.evaluators = evaluators
+        self.early_stopping = early_stopping
+        self.cost_threshold = cost_threshold
+        
+        # Organize evaluators by tier
+        self.tier1 = []  # Fast, free
+        self.tier2 = []  # Medium, free
+        self.tier3 = []  # Slow, costly
+        
+        for evaluator in evaluators:
+            if isinstance(evaluator, (LengthValidator, EntityHallucinationDetector, SemanticConsistencyChecker)):
+                self.tier1.append(evaluator)
+            elif isinstance(evaluator, NLIConsistencyChecker):
+                self.tier2.append(evaluator)
+            else:
+                self.tier3.append(evaluator)
+    
+    def evaluate(
+        self,
+        context: EvaluationContext,
+        run_tier3: Optional[bool] = None
+    ) -> AggregatedResult:
+        """Run evaluation pipeline with smart tier execution"""
+        
+        start_time = time.time()
+        all_results = {}
+        
+        # Tier 1: Always run (fast, free)
+        logger.info("Running Tier 1 evaluators...")
+        for evaluator in self.tier1:
+            if evaluator.should_run(context):
+                result = evaluator.evaluate(context)
+                all_results[evaluator.name] = result
+                logger.info(f"  {evaluator.name}: {result.score:.2f} ({result.status.value})")
+        
+        # Check if we should stop early
+        tier1_score = self._calculate_weighted_score(all_results)
+        critical_failure = any(
+            r.status == EvaluationStatus.FAILED and self._is_critical(r.metric_name)
+            for r in all_results.values()
+        )
+        
+        if self.early_stopping and (critical_failure or tier1_score < 0.3):
+            logger.info("Early stopping: Critical failure detected in Tier 1")
+            return self._aggregate_results(all_results, time.time() - start_time)
+        
+        # Tier 2: Run if Tier 1 looks reasonable
+        logger.info("Running Tier 2 evaluators...")
+        for evaluator in self.tier2:
+            if evaluator.should_run(context):
+                result = evaluator.evaluate(context)
+                all_results[evaluator.name] = result
+                logger.info(f"  {evaluator.name}: {result.score:.2f} ({result.status.value})")
+        
+        # Tier 3: Decision logic
+        tier2_score = self._calculate_weighted_score(all_results)
+        
+        should_run_tier3 = run_tier3 if run_tier3 is not None else self._should_run_tier3(
+            tier2_score, all_results
+        )
+        
+        if should_run_tier3:
+            logger.info("Running Tier 3 evaluators (LLM-as-Judge)...")
+            for evaluator in self.tier3:
+                if evaluator.should_run(context):
+                    result = evaluator.evaluate(context)
+                    all_results[evaluator.name] = result
+                    logger.info(f"  {evaluator.name}: {result.score:.2f} ({result.status.value})")
+        else:
+            logger.info("Skipping Tier 3 (cost optimization)")
+        
+        return self._aggregate_results(all_results, time.time() - start_time)
+    
+    def _should_run_tier3(self, current_score: float, results: Dict) -> bool:
+        """Decide if Tier 3 (expensive LLM calls) should run"""
+        
+        # Run if borderline (needs deeper analysis)
+        if 0.4 <= current_score <= 0.75:
+            return True
+        
+        # Run if any checks flagged for review
+        if any(r.status == EvaluationStatus.FLAGGED for r in results.values()):
+            return True
+        
+        # Random 10% sampling for monitoring
+        import random
+        if random.random() < 0.1:
+            logger.info("Running Tier 3 for random sampling")
+            return True
+        
+        return False
+    
+    def _calculate_weighted_score(self, results: Dict[str, EvaluationResult]) -> float:
+        """Calculate weighted average score"""
+        if not results:
+            return 0.5
+        
+        total_weight = sum(self._get_weight(name) for name in results.keys())
+        if total_weight == 0:
+            return sum(r.score for r in results.values()) / len(results)
+        
+        weighted_sum = sum(
+            r.score * self._get_weight(name)
+            for name, r in results.items()
+        )
+        
+        return weighted_sum / total_weight
+    
+    def _get_weight(self, evaluator_name: str) -> float:
+        """Get weight for evaluator"""
+        for evaluator in self.evaluators:
+            if evaluator.name == evaluator_name:
+                return evaluator.weight
+        return 1.0
+    
+    def _is_critical(self, evaluator_name: str) -> bool:
+        """Check if evaluator is critical"""
+        for evaluator in self.evaluators:
+            if evaluator.name == evaluator_name:
+                return evaluator.critical
+        return False
+    
+    def _aggregate_results(
+        self,
+        results: Dict[str, EvaluationResult],
+        elapsed_time: float
+    ) -> AggregatedResult:
+        """Aggregate individual results into final verdict"""
+        
+        overall_score = self._calculate_weighted_score(results)
+        
+        # Determine overall status
+        has_failures = any(r.status == EvaluationStatus.FAILED for r in results.values())
+        has_flags = any(r.status == EvaluationStatus.FLAGGED for r in results.values())
+        
+        if has_failures:
+            overall_status = EvaluationStatus.FAILED
+        elif has_flags:
+            overall_status = EvaluationStatus.FLAGGED
+        else:
+            overall_status = EvaluationStatus.PASSED
+        
+        # Flag for human review
+        flagged = (
+            overall_status == EvaluationStatus.FLAGGED or
+            (overall_status == EvaluationStatus.FAILED and overall_score > 0.4) or
+            overall_score == 0.5  # Uncertain
+        )
+        
+        # Calculate overall confidence
+        confidences = [r.confidence for r in results.values() if r.confidence > 0]
+        overall_confidence = sum(confidences) / len(confidences) if confidences else 0.5
+        
+        # Generate summary
+        summary = self._generate_summary(results, overall_score, overall_status)
+        
+        logger.info(f"Evaluation complete in {elapsed_time:.2f}s")
+        logger.info(f"Overall: {overall_score:.2f} ({overall_status.value})")
+        
+        return AggregatedResult(
+            overall_score=overall_score,
+            overall_status=overall_status,
+            individual_results=results,
+            flagged_for_review=flagged,
+            confidence=overall_confidence,
+            summary=summary
+        )
+    
+    def _generate_summary(
+        self,
+        results: Dict[str, EvaluationResult],
+        score: float,
+        status: EvaluationStatus
+    ) -> str:
+        """Generate human-readable summary"""
+        
+        if status == EvaluationStatus.PASSED:
+            summary = f"✓ Response passed all checks (score: {score:.2f})"
+        elif status == EvaluationStatus.FAILED:
+            failures = [
+                f"{name}: {r.reasoning}"
+                for name, r in results.items()
+                if r.status == EvaluationStatus.FAILED
+            ]
+            summary = f"✗ Response failed: {'; '.join(failures)}"
+        else:
+            flags = [
+                f"{name}: {r.reasoning}"
+                for name, r in results.items()
+                if r.status == EvaluationStatus.FLAGGED
+            ]
+            summary = f"⚠ Response flagged: {'; '.join(flags)}"
+        
+        return summary
