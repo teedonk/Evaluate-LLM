@@ -177,9 +177,12 @@ class EntityHallucinationDetector(BaseEvaluator):
     
     def __init__(self):
         super().__init__(name="entity_hallucination", weight=1.5, critical=True)
-        import spacy
         try:
+            import spacy
             self.nlp = spacy.load("en_core_web_sm")
+        except ImportError:
+            logger.warning("Spacy not installed. Install with: pip install spacy && python -m spacy download en_core_web_sm")
+            self.nlp = None
         except OSError:
             logger.warning("Spacy model not found. Run: python -m spacy download en_core_web_sm")
             self.nlp = None
