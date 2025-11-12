@@ -2,6 +2,14 @@
  Complete LLM Evaluation Pipeline
 """
 
+import sys
+import io
+
+# Set UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
@@ -1287,13 +1295,24 @@ class EvaluatorValidator:
         f1 = f1_score(human_labels, llm_labels)
         
         # Classification report
+        # Get unique labels to handle edge cases
+        unique_labels = sorted(set(human_labels + llm_labels))
+        target_names = ['Fail', 'Pass'] if len(unique_labels) == 2 else [f'Class_{i}' for i in unique_labels]
+
         report = classification_report(
             human_labels,
             llm_labels,
-            target_names=['Fail', 'Pass'],
-            output_dict=True
+            labels=unique_labels,
+            target_names=target_names[:len(unique_labels)],
+            output_dict=True,
+            zero_division=0
         )
         
+        # Safely extract precision and recall
+        pass_label = 'Pass' if 'Pass' in report else (target_names[1] if len(target_names) > 1 else target_names[0])
+        precision = report.get(pass_label, {}).get('precision', 0.0)
+        recall = report.get(pass_label, {}).get('recall', 0.0)
+
         validation_results = {
             'correlation': {
                 'pearson': pearson_corr,
@@ -1305,8 +1324,8 @@ class EvaluatorValidator:
                 'accuracy': accuracy,
                 'cohens_kappa': kappa,
                 'f1_score': f1,
-                'precision': report['Pass']['precision'],
-                'recall': report['Pass']['recall']
+                'precision': precision,
+                'recall': recall
             },
             'interpretation': self._interpret_results(pearson_corr, kappa, accuracy)
         }
@@ -1323,8 +1342,8 @@ class EvaluatorValidator:
         print(f"  Accuracy:      {accuracy:.1%}")
         print(f"  Cohen's Kappa: {kappa:.3f}")
         print(f"  F1 Score:      {f1:.3f}")
-        print(f"  Precision:     {report['Pass']['precision']:.1%}")
-        print(f"  Recall:        {report['Pass']['recall']:.1%}")
+        print(f"  Precision:     {precision:.1%}")
+        print(f"  Recall:        {recall:.1%}")
         
         print(f"\nInterpretation:")
         print(f"  {validation_results['interpretation']}")
@@ -1550,8 +1569,8 @@ def main():
     test_contexts = [
         EvaluationContext(
             query=f"What is {2+i} + {3+i}?",
-            response=f"The answer is {2+i+3+i}.",
-            reference_docs=f"{2+i} plus {3+i} equals {5+2*i}."
+            response=f"The answer to {2+i} + {3+i} is {5+2*i}. This is a simple addition problem.",
+            reference_docs=f"When adding {2+i} plus {3+i}, the result equals {5+2*i}."
         )
         for i in range(5)
     ]
